@@ -1,3 +1,10 @@
+#include <stdlib.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <fcntl.h>
+
 #include "systemcalls.h"
 
 /**
@@ -16,6 +23,11 @@ bool do_system(const char *cmd)
  *   and return a boolean true if the system() call completed with success
  *   or false() if it returned a failure
 */
+    if (cmd == NULL)
+        return false;
+
+    if (system(cmd) != 0)
+        return false;
 
     return true;
 }
@@ -40,6 +52,7 @@ bool do_exec(int count, ...)
     va_start(args, count);
     char * command[count+1];
     int i;
+
     for(i=0; i<count; i++)
     {
         command[i] = va_arg(args, char *);
@@ -47,7 +60,9 @@ bool do_exec(int count, ...)
     command[count] = NULL;
     // this line is to avoid a compile warning before your implementation is complete
     // and may be removed
-    command[count] = command[count];
+    // command[count] = command[count];
+
+    va_end(args);
 
 /*
  * TODO:
@@ -58,8 +73,26 @@ bool do_exec(int count, ...)
  *   as second argument to the execv() command.
  *
 */
+    pid_t cpid;
+    int wstatus;
 
-    va_end(args);
+    cpid = fork();
+    if (cpid == -1)
+        return false;
+
+    if (cpid == 0) {    /* child */
+        if (execv(command[0], command) == -1)
+            exit(EXIT_FAILURE);
+    } else {            /* parent */
+        /* wait for change in child process and return false
+         * when child failed on error. */
+        do {
+            if (waitpid(cpid, &wstatus, 0) == -1)
+                return false;
+            if (WEXITSTATUS(wstatus) != 0)
+                return false;
+        } while (!WIFEXITED(wstatus));
+    }
 
     return true;
 }
@@ -75,6 +108,7 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
     va_start(args, count);
     char * command[count+1];
     int i;
+
     for(i=0; i<count; i++)
     {
         command[i] = va_arg(args, char *);
@@ -83,6 +117,7 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
     // this line is to avoid a compile warning before your implementation is complete
     // and may be removed
     command[count] = command[count];
+    va_end(args);
 
 
 /*
@@ -92,8 +127,37 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
  *   The rest of the behaviour is same as do_exec()
  *
 */
+    pid_t cpid;
+    int wstatus;
+    int fd;
 
-    va_end(args);
+    // create a file with 644 permission
+    fd = open(outputfile, (O_WRONLY|O_TRUNC|O_CREAT),
+                (S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH));
+    if (fd < 0)
+        return false;
+
+    cpid = fork();
+    if (cpid == -1)
+        return false;
+
+    if (cpid == 0) {    /* child */
+        if (dup2(fd, 1) < 0)
+            return false;
+
+        close(fd);
+        if (execv(command[0], command) == -1)
+            exit(EXIT_FAILURE);
+    } else {            /* parent */
+        do {
+            if (waitpid(cpid, &wstatus, 0) == -1)
+                return false;
+            if (WEXITSTATUS(wstatus) != 0)
+                return false;
+        } while (!WIFEXITED(wstatus));
+        close(fd);
+    }
+
 
     return true;
 }
