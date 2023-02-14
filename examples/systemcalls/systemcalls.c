@@ -138,24 +138,25 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
         return false;
 
     cpid = fork();
-    if (cpid == -1)
+    if (cpid == -1) {
+        close(fd);
+
         return false;
+    }
 
     if (cpid == 0) {    /* child */
-        if (dup2(fd, 1) < 0)
-            return false;
-
+        dup2(fd, 1);
         close(fd);
         if (execv(command[0], command) == -1)
             exit(EXIT_FAILURE);
     } else {            /* parent */
+        close(fd);
         do {
             if (waitpid(cpid, &wstatus, 0) == -1)
                 return false;
             if (WEXITSTATUS(wstatus) != 0)
                 return false;
         } while (!WIFEXITED(wstatus));
-        close(fd);
     }
 
 
