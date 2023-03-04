@@ -20,7 +20,7 @@ EXE		= aesdsocket
 all: $(EXE)
 
 ${EXE}: $(OBJS)
-	$(CC) -o $@ $^ ${LFLAGS}
+	$(CC) -o $@ $^ ${LDFLAGS}
 
 %.o: %.c
 	$(CC) ${CFLAGS} -o $@ -c $<
