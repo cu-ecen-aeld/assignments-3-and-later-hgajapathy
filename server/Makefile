@@ -1,9 +1,17 @@
 # Referred https://www.gnu.org/software/make/manual/make.pdf
 
-CC = $(CROSS_COMPILE)gcc
-# CFLAGS	:= -g -Wall -Werror
-CFLAGS	:= -Wall -Werror
-LFLAGS	:= -pthread -lrt
+# If variables aren't define, define them
+ifeq ($(CC),)
+	CC = gcc
+endif
+
+ifeq ($(CFLAGS),)
+	CFLAGS = -Werror -Wall
+endif
+
+ifeq ($(LDFLAGS),)
+	LDFLAGS = -pthread -lrt
+endif
 
 SRC		= $(wildcard *.c)
 OBJS	= $(SRC:.c=.o)
