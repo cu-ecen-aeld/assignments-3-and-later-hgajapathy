@@ -1,12 +1,11 @@
 # Referred https://www.gnu.org/software/make/manual/make.pdf
 
-# If variables aren't define, define them
 ifeq ($(CC),)
-	CC = gcc
+	CC = $(CROSS_COMPILE)gcc
 endif
 
 ifeq ($(CFLAGS),)
-	CFLAGS = -Werror -Wall
+	CFLAGS = -g -Werror -Wall
 endif
 
 ifeq ($(LDFLAGS),)
@@ -23,7 +22,7 @@ ${EXE}: $(OBJS)
 	$(CC) -o $@ $^ ${LDFLAGS}
 
 %.o: %.c
-	$(CC) ${CFLAGS} -o $@ -c $<
+	$(CC) -c ${CFLAGS} $< -o $@
 
 .PHONY: clean
 

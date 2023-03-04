@@ -1,10 +1,18 @@
 /**
  * @file    aesdsocket.c
- * @brief
+ *
+ * @brief   A multithreaded TCP socket server.
+ *
  * @author  Harinarayanan Gajapathy (haga9942@colorado.edu)
  * @date    2023-03-02
  *
- * @copyright Copyright (c) 2023
+ * @copyright Copyright (c) 2023 Harinarayanan Gajapathy
+ * Redistribution, modification or use of this software in source or binary
+ * forms is permitted as long as the files maintain this copyright. Users
+ * are permitted to modify this and use it to learn about the field of
+ * embedded software. Harinarayanan Gajapathy and the University of Colorado
+ * are not liable for any misuse of this material
+ *
  */
 
 #include <stdio.h>
@@ -22,20 +30,21 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 
-#include "queue.h"
+#include "queue.h"      /* taken from https://github.com/freebsd/freebsd-src/blob/main/sys/sys/queue.h */
 
+#define DEBUG
 #ifdef DEBUG
-#define SYSLOG_OPTIONS      (LOG_PERROR | LOG_NDELAY)
+#define SYSLOG_OPTIONS          (LOG_PERROR | LOG_NDELAY)
 #else
-#define SYSLOG_OPTIONS      (LOG_NDELAY)
+#define SYSLOG_OPTIONS          (LOG_NDELAY)
 #endif
 
-#define PORT_NUMBER         9000
-#define MAX_BACKLOG         10
-#define MAX_BUF_LEN         1024
-#define FILE_MODE           0644
-#define NULL_BYTE           1
-#define TIMER_THREAD_PERIOD 10
+#define PORT_NUMBER             9000
+#define MAX_BACKLOG             10
+#define MAX_BUF_LEN             1024
+#define FILE_MODE               0644
+#define NULL_BYTE               1
+#define TIMER_THREAD_PERIOD     10
 
 const char *log_file = "/var/tmp/aesdsocketdata";
 volatile sig_atomic_t caught_signal = 0;
@@ -49,9 +58,9 @@ struct node {
 };
 
 /**
- * @brief
+ * @brief Signal handler
  *
- * @param signo
+ * @param signo SIGINT or SIGTERM
  */
 static void signal_handler(int signo)
 {
@@ -62,7 +71,10 @@ static void signal_handler(int signo)
 }
 
 /**
- * @brief
+ * @brief Write client packet to *log_file when a new '\n' line
+ * character is found in client TCP stream and echo back the
+ * packet to client. This function implements locking functions
+ * using pthread mutex to synchronize access to *log_file.
  *
  * @param msg message from client
  * @param fd client fd to echo data
@@ -75,6 +87,7 @@ static int process_msg(char *msg, int fd, pthread_mutex_t *mutex)
     char *start, *end;
     struct stat statbuf;
     char *buf = NULL;
+    off_t offset = 0;
 
     start = end = (char *) msg;
 
@@ -109,39 +122,35 @@ static int process_msg(char *msg, int fd, pthread_mutex_t *mutex)
         }
 
         /* allocate memory to read file contents */
-        buf = (char *) calloc(statbuf.st_size, sizeof(char));
+        buf = (char *) calloc(MAX_BUF_LEN, sizeof(char));
         if (buf == NULL) {
             syslog(LOG_ERR, "failed to allocate memory to read data from %s", log_file);
             rc = -1;
             goto exit;
         }
 
-        /* reposition file offset to begining */
-        lseek(log_file_fd, 0, SEEK_SET);
-
-        /* read file contents */
+        /* read file contents and send to client */
         cnt = 0;
         while (cnt != statbuf.st_size) {
-            rc = read(log_file_fd, buf + cnt, statbuf.st_size - cnt);
+            rc = pread(log_file_fd, buf, MAX_BUF_LEN, offset);
             if (rc == -1) {
                 if (errno == EINTR)
                     continue;
                 goto exit;
             }
             cnt += rc;
-        }
+            offset += rc;
 
-        /* send file contents to client */
-        cnt = 0;
-        while (cnt != statbuf.st_size) {
-            rc = send(fd, buf + cnt, (statbuf.st_size - cnt), 0);
+            rc = send(fd, buf, cnt, 0);
             if (rc == -1) {
                 if (errno == EINTR)
                     continue;
                 goto exit;
             }
-            cnt += rc;
+
+            memset(buf, 0, MAX_BUF_LEN);
         }
+
         start = end + 1;
     }
 
@@ -155,10 +164,11 @@ exit:
 }
 
 /**
- * @brief
+ * @brief A thread function runs for every new incoming client
+ * connection.
  *
- * @param thread_param
- * @return void*
+ * @param thread_param struct node data
+ * @return void* returns NULL
  */
 void *thread_func(void *thread_param)
 {
@@ -174,18 +184,16 @@ void *thread_func(void *thread_param)
 
     n = (struct node *) thread_param;
 
+    /* save every incoming data to msg buffer and search for '\n' character */
     while (((rc = recv(n->connfd, buf, MAX_BUF_LEN, 0)) > 0) && caught_signal == 0) {
-        /* save client buf to msg for processing */
         if ((msg_size - msg_len) < rc) {
             msg_size += (rc + NULL_BYTE);
 
             msg = (char *) realloc(msg, msg_size);
             if (msg == NULL) {
                 syslog(LOG_ERR, "failed to allocate memory for msg");
-                goto exit;
+                break;
             }
-
-            /* initialize allocated memory */
             memset(msg + msg_len, 0, msg_size - msg_len);
         }
 
@@ -199,14 +207,20 @@ void *thread_func(void *thread_param)
     if (msg != NULL)
         free(msg);
 
-exit:
-    close(n->connfd);
-    n->connfd = -1;
     n->thread_complete_success = 1;
+    close(n->connfd);
 
     return NULL;
 }
 
+/**
+ * @brief A timerthread function logs timestamp to *log_file every
+ * TIMER_THREAD_PERIOD seconds. The sleep routine is based on
+ * explanation from Chapter: 11 Time.
+ *
+ * @param thread_param struct node data
+ * @return void* returns NULL
+ */
 void *timer_thread_func(void *thread_param)
 {
     struct node *n = NULL;
@@ -222,26 +236,56 @@ void *timer_thread_func(void *thread_param)
     n = (struct node *) thread_param;
 
     while (!caught_signal) {
-        if (clock_gettime(CLOCK_MONOTONIC, &ts) == -1)
+        if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+            syslog(LOG_ERR, "failed to retrieve time");
             break;
+        }
 
-        ts.tv_sec += TIMER_THREAD_PERIOD;
-        if (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) != 0)
+        ts.tv_sec += TIMER_THREAD_PERIOD;   /* 10 seconds */
+        if (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) != 0) {
+            syslog(LOG_ERR, "failed to sleep");
             break;
+        }
 
         t = time(NULL);
+        if (t == ((time_t) -1)) {
+            syslog(LOG_ERR, "failed to retrieve the seconds since epoch");
+            break;
+        }
+
         tmp = localtime(&t);
-        strftime(outstr, sizeof(outstr), "timestamp:  %Y, %b, %d, %H:%M:%S\n", tmp);
+        if (tmp == NULL) {
+            syslog(LOG_ERR, "failed to retrieve localtime");
+            break;
+        }
+
+        strftime(outstr, sizeof(outstr), "timestamp: %Y, %b, %d, %H:%M:%S\n", tmp);
 
         fd = open(log_file, (O_CREAT | O_APPEND | O_RDWR), FILE_MODE);
+        if (fd == -1) {
+            syslog(LOG_ERR, "failed to open %s", log_file);
+            break;
+        }
 
-        pthread_mutex_lock(n->mutex);
-        write(fd, outstr, strlen(outstr));
-        pthread_mutex_unlock(n->mutex);
+        if (pthread_mutex_lock(n->mutex) != 0) {
+            close(fd);
+            syslog(LOG_ERR, "failed to lock mutex object before writing timestamp");
+            break;
+        }
+
+        if (write(fd, outstr, strlen(outstr)) == -1)
+            syslog(LOG_ERR, "failed to write timestamp to %s", log_file);
+
+        if (pthread_mutex_unlock(n->mutex) != 0) {
+            close(fd);
+            syslog(LOG_ERR, "failed to unlock mutex object after writing timestamp");
+            break;
+        }
 
         close(fd);
     }
 
+    /* we set this flag to make the parent process to join the thread */
     n->thread_complete_success = 1;
 
     return NULL;
@@ -303,59 +347,61 @@ static int aesdsocket(int *mode)
     struct node *n_tmp = NULL;
     pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 
-    /* init singly linked-list */
+    /* init linked-list */
     SLIST_HEAD(head_s, node) head;
     SLIST_INIT(&head);
 
     rc = create_listener_socket(&socket, PORT_NUMBER);
     if (rc == -1)
-        goto cleanup;
+        goto error;
 
     if (*mode)
         daemon(0, 0);
 
-    /* timer thread to write timestamp to log_file */
+    /* timer thread to write timestamp to *log_file */
     n = (struct node *) calloc(1, sizeof(struct node));
     if (n == NULL) {
-        syslog(LOG_ERR, "failed to allocate memory for timer thread node: %s", strerror(errno));
+        syslog(LOG_ERR, "failed to allocate memory for timer node: %s", strerror(errno));
         rc = -1;
-        goto cleanup;
+        goto error;
     }
     n->mutex = &mutex;
     n->thread_complete_success = 0;
     rc = pthread_create(&n->tid, NULL, timer_thread_func, n);
     if (rc != 0) {
-        syslog(LOG_ERR, "failed to create thread: %s", strerror(errno));
-        goto cleanup;
+        syslog(LOG_ERR, "failed to create timer thread: %s", strerror(errno));
+        goto error;
     }
     SLIST_INSERT_HEAD(&head, n, nodes);
 
     while (!caught_signal) {
         newfd = accept(socket, (struct sockaddr *) &addr, &addrlen);
-        if (newfd == -1)
+        if (newfd == -1) {
+            rc = -1;
             goto reap_threads;
+        }
 
         syslog(LOG_INFO, "Accepted connection from %s", inet_ntoa(addr.sin_addr));
 
         /* thread per client connection */
         n = (struct node *) calloc(1, sizeof(struct node));
         if (n == NULL) {
-            syslog(LOG_ERR, "failed to allocate memory for client thread node: %s", strerror(errno));
+            syslog(LOG_ERR, "failed to allocate memory for client node: %s", strerror(errno));
             rc = -1;
-            goto cleanup;
+            goto error;
         }
         n->connfd = newfd;
         n->mutex = &mutex;
         n->thread_complete_success = 0;
         rc = pthread_create(&n->tid, NULL, thread_func, n);
         if (rc != 0) {
-            syslog(LOG_ERR, "failed to create thread: %s", strerror(errno));
-            goto cleanup;
+            syslog(LOG_ERR, "failed to create client thread: %s", strerror(errno));
+            goto error;
         }
         SLIST_INSERT_HEAD(&head, n, nodes);
 
 reap_threads:
-        /* remove all thread from linked-list, if it is completed */
+        /* remove all thread from linked-list, if threads have completed execution */
         n = NULL;
         SLIST_FOREACH_SAFE(n, &head, nodes, n_tmp) {
             if (n->thread_complete_success) {
@@ -366,7 +412,12 @@ reap_threads:
         }
     }
 
-cleanup:
+error:
+    if (socket != -1) {
+        shutdown(socket, SHUT_RDWR);
+        close(socket);
+    }
+
     /* delete linked-list */
     n = NULL;
     while (!SLIST_EMPTY(&head)) {
@@ -376,14 +427,13 @@ cleanup:
     }
     SLIST_INIT(&head);
 
-    shutdown(socket, SHUT_RDWR);
-    close(socket);
+    pthread_mutex_destroy(&mutex);
 
     return rc;
 }
 
 /**
- * @brief       main
+ * @brief       main function
  *
  * @param argc  argument count
  * @param argv  argument values as vector
