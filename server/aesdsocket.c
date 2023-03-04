@@ -32,7 +32,7 @@
 
 #include "queue.h"      /* taken from https://github.com/freebsd/freebsd-src/blob/main/sys/sys/queue.h */
 
-#define DEBUG
+// #define DEBUG    /* un-comment this line to redirect output to stdout */
 #ifdef DEBUG
 #define SYSLOG_OPTIONS          (LOG_PERROR | LOG_NDELAY)
 #else
