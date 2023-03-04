@@ -1,7 +1,9 @@
 # Referred https://www.gnu.org/software/make/manual/make.pdf
 
 CC = $(CROSS_COMPILE)gcc
+# CFLAGS	:= -g -Wall -Werror
 CFLAGS	:= -Wall -Werror
+LFLAGS	:= -lpthread
 
 SRC		= $(wildcard *.c)
 OBJS	= $(SRC:.c=.o)
@@ -10,10 +12,10 @@ EXE		= aesdsocket
 all: $(EXE)
 
 ${EXE}: $(OBJS)
-	$(CC) -o $@ $^
+	$(CC) -o $@ $^ ${LFLAGS}
 
 %.o: %.c
-	$(CC) -o $@ -c $< ${CFLAGS}
+	$(CC) ${CFLAGS} -o $@ -c $<
 
 .PHONY: clean
 
