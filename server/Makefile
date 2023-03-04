@@ -3,7 +3,7 @@
 CC = $(CROSS_COMPILE)gcc
 # CFLAGS	:= -g -Wall -Werror
 CFLAGS	:= -Wall -Werror
-LFLAGS	:= -lpthread
+LFLAGS	:= -pthread -lrt
 
 SRC		= $(wildcard *.c)
 OBJS	= $(SRC:.c=.o)
