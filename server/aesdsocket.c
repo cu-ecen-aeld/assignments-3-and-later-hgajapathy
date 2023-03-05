@@ -86,7 +86,7 @@ static int process_msg(char *msg, int fd, pthread_mutex_t *mutex)
     int log_file_fd, cnt;
     char *start, *end;
     struct stat statbuf;
-    char *buf = NULL;
+    char buf[MAX_BUF_LEN];
     off_t offset = 0;
 
     start = end = (char *) msg;
@@ -103,14 +103,22 @@ static int process_msg(char *msg, int fd, pthread_mutex_t *mutex)
         /* write packet to log file */
         cnt = 0;
         while (cnt != ((end - start) + 1)) {
-            pthread_mutex_lock(mutex);
-            rc = write(log_file_fd, &start[cnt], (((end - start) + 1) - cnt));
-            pthread_mutex_unlock(mutex);
-            if (rc == -1) {
-                if (errno == EINTR)
-                    continue;
+
+            if (pthread_mutex_lock(mutex) != 0) {
+                syslog(LOG_ERR, "failed to lock mutex object before writing data to file");
                 goto exit;
             }
+
+            rc = write(log_file_fd, &start[cnt], (((end - start) + 1) - cnt));
+
+            if (pthread_mutex_unlock(mutex) != 0) {
+                syslog(LOG_ERR, "failed to lock mutex object after writing data to file");
+                goto exit;
+            }
+
+            if (rc == -1)
+                goto exit;
+
             cnt += rc;
         }
 
@@ -121,43 +129,28 @@ static int process_msg(char *msg, int fd, pthread_mutex_t *mutex)
             goto exit;
         }
 
-        /* allocate memory to read file contents */
-        buf = (char *) calloc(MAX_BUF_LEN, sizeof(char));
-        if (buf == NULL) {
-            syslog(LOG_ERR, "failed to allocate memory to read data from %s", log_file);
-            rc = -1;
-            goto exit;
-        }
-
         /* read file contents and send to client */
+        memset(buf, 0, MAX_BUF_LEN);
         cnt = 0;
         while (cnt != statbuf.st_size) {
+
             rc = pread(log_file_fd, buf, MAX_BUF_LEN, offset);
-            if (rc == -1) {
-                if (errno == EINTR)
-                    continue;
+            if (rc == -1)
                 goto exit;
-            }
+
             cnt += rc;
             offset += rc;
 
             rc = send(fd, buf, cnt, 0);
-            if (rc == -1) {
-                if (errno == EINTR)
-                    continue;
+            if (rc == -1)
                 goto exit;
-            }
 
             memset(buf, 0, MAX_BUF_LEN);
         }
-
         start = end + 1;
     }
 
 exit:
-    if (buf != NULL)
-        free(buf);
-
     close(log_file_fd);
 
     return (rc != -1) ? 0 : -1;
