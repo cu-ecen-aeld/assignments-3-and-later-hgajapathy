@@ -1,16 +1,8 @@
 # Referred https://www.gnu.org/software/make/manual/make.pdf
 
-ifeq ($(CC),)
-	CC = $(CROSS_COMPILE)gcc
-endif
-
-ifeq ($(CFLAGS),)
-	CFLAGS = -g -Werror -Wall
-endif
-
-ifeq ($(LDFLAGS),)
-	LDFLAGS = -pthread -lrt
-endif
+CC 		?= $(CROSS_COMPILE)gcc
+CFLAGS 	?= -g -Werror -Wall
+LDFLAGS ?= -pthread
 
 SRC		= $(wildcard *.c)
 OBJS	= $(SRC:.c=.o)
