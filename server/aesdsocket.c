@@ -1,284 +1,479 @@
 /**
- * A simple socket server to accept incoming connection
- * and echo received data back to client.
+ * @file    aesdsocket.c
+ *
+ * @brief   A multithreaded TCP socket server.
+ *
+ * @author  Harinarayanan Gajapathy (haga9942@colorado.edu)
+ * @date    2023-03-02
+ *
+ * @copyright Copyright (c) 2023 Harinarayanan Gajapathy
+ * Redistribution, modification or use of this software in source or binary
+ * forms is permitted as long as the files maintain this copyright. Users
+ * are permitted to modify this and use it to learn about the field of
+ * embedded software. Harinarayanan Gajapathy and the University of Colorado
+ * are not liable for any misuse of this material
+ *
  */
 
 #include <stdio.h>
 #include <string.h>
-#include <syslog.h>
-#include <signal.h>
 #include <unistd.h>
+#include <signal.h>
+#include <syslog.h>
+#include <errno.h>
+#include <stdlib.h>
 #include <sys/types.h>
 #include <sys/socket.h>
-#include <netdb.h>
 #include <arpa/inet.h>
-#include <stdlib.h>
-#include <errno.h>
+#include <pthread.h>
+#include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 
-#define DEBUG
+#include "queue.h"      /* taken from https://github.com/freebsd/freebsd-src/blob/main/sys/sys/queue.h */
+
+// #define DEBUG    /* un-comment this line to redirect output to stdout */
 #ifdef DEBUG
-#define SYSLOG_OPTIONS      (LOG_PERROR | LOG_NDELAY)
+#define SYSLOG_OPTIONS          (LOG_PERROR | LOG_NDELAY)
 #else
-#define SYSLOG_OPTIONS      (LOG_NDELAY)
+#define SYSLOG_OPTIONS          (LOG_NDELAY)
 #endif
 
-#define MAX_ARGS            1
-#define PORT                "9000"      // Port we're listening on
-#define BACKLOG             10
-#define MAX_LEN             100
+#define PORT_NUMBER             9000
+#define MAX_BACKLOG             10
+#define MAX_BUF_LEN             1024
+#define FILE_MODE               0644
+#define NULL_BYTE               1
+#define TIMER_THREAD_PERIOD     10
 
-volatile sig_atomic_t interrupted = 0;
 const char *log_file = "/var/tmp/aesdsocketdata";
+volatile sig_atomic_t caught_signal = 0;
 
+struct node {
+    pthread_t tid;
+    pthread_mutex_t *mutex;
+    int connfd;
+    int thread_complete_success;
+    SLIST_ENTRY(node) nodes;
+};
+
+/**
+ * @brief Signal handler
+ *
+ * @param signo SIGINT or SIGTERM
+ */
 static void signal_handler(int signo)
 {
-    interrupted = 1;
-    syslog(LOG_INFO, "Caught signal, exiting");
-}
-
-static int echo_data(int client)
-{
-    char *buf;
-    int fd, ret;
-    struct stat statbuf;
-
-    fd = open(log_file, O_RDONLY, (S_IWUSR|S_IRUSR|S_IRGRP|S_IROTH));
-    if (fd < 0) {
-        syslog(LOG_ERR, "Unable to open file %s", log_file);
-        return -1;
+    if (signo == SIGINT || signo == SIGTERM) {
+        caught_signal = 1;
+        syslog(LOG_INFO, "Caught signal, exiting");
     }
-
-    fstat(fd, &statbuf);
-    if ((buf = (char *)calloc(statbuf.st_size, sizeof(char))) == NULL) {
-        syslog(LOG_ERR, "Failed to allocate memory for reading file: %s", strerror(errno));
-        close(fd);
-        return -1;
-    }
-
-    if ((ret = read(fd, buf, statbuf.st_size)) == -1) {
-        syslog(LOG_ERR, "Failed to read file: %s", strerror(errno));
-    } else {
-        close(fd);
-        if ((ret = send(client, buf, statbuf.st_size, 0)) == -1)
-            syslog(LOG_ERR, "Failed to send data to client: %s", strerror(errno));
-        free(buf);
-    }
-
-    return ret;
 }
 
 /**
- * Parse the data with newline delimiter and appaned the tokens to log_file.
+ * @brief Write client packet to *log_file when a new '\n' line
+ * character is found in client TCP stream and echo back the
+ * packet to client. This function implements locking functions
+ * using pthread mutex to synchronize access to *log_file.
+ *
+ * @param msg message from client
+ * @param fd client fd to echo data
+ * @return int 0 on success or -1 on failure
  */
-static int process_data(char *data)
+static int process_msg(char *msg, int fd, pthread_mutex_t *mutex)
 {
-    int fd;
-    char *start, *end, *token;
-    int ret = 0;    /* this is set to 0 to handle exit cases for stream w/o new line */
+    int rc = 0;
+    int log_file_fd, cnt;
+    char *start, *end;
+    struct stat statbuf;
+    char buf[MAX_BUF_LEN];
+    off_t offset = 0;
 
-    fd = open(log_file,
-              (O_WRONLY | O_CREAT | O_APPEND | O_DSYNC),
-              (S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH));
-    if (fd == -1) {
-        syslog(LOG_ERR, "Unable to open file %s", log_file);
-        return -1;
+    start = end = (char *) msg;
+
+    rc = open(log_file, (O_CREAT | O_APPEND | O_RDWR), FILE_MODE);
+    if (rc == -1) {
+        syslog(LOG_ERR, "failed to open %s", log_file);
+        return rc;
     }
 
-    /* append packets to log_file when a new line present
-     * in the stream */
-    start = end = data;
+    log_file_fd = rc;
+
     while ((end = strchr(start, '\n')) != NULL) {
-        token = strsep(&start, "\n");
-        if ((ret = write(fd, token, strlen(token))) == -1) {
-            syslog(LOG_ERR, "Failed to write data to log file: %s", strerror(errno));
-            break;
+        /* write packet to log file */
+        cnt = 0;
+        while (cnt != ((end - start) + 1)) {
+
+            if (pthread_mutex_lock(mutex) != 0) {
+                syslog(LOG_ERR, "failed to lock mutex object before writing data to file");
+                goto exit;
+            }
+
+            rc = write(log_file_fd, &start[cnt], (((end - start) + 1) - cnt));
+
+            if (pthread_mutex_unlock(mutex) != 0) {
+                syslog(LOG_ERR, "failed to lock mutex object after writing data to file");
+                goto exit;
+            }
+
+            if (rc == -1)
+                goto exit;
+
+            cnt += rc;
         }
-        write(fd, "\n", sizeof(char));
+
+        /* read file total size, in bytes */
+        rc = fstat(log_file_fd, &statbuf);
+        if (rc != 0) {
+            syslog(LOG_ERR, "failed to obtain information about %s", log_file);
+            goto exit;
+        }
+
+        /* read file contents and send to client */
+        memset(buf, 0, MAX_BUF_LEN);
+        cnt = 0;
+        while (cnt != statbuf.st_size) {
+
+            rc = pread(log_file_fd, buf, MAX_BUF_LEN, offset);
+            if (rc == -1)
+                goto exit;
+
+            cnt += rc;
+            offset += rc;
+
+            rc = send(fd, buf, cnt, 0);
+            if (rc == -1)
+                goto exit;
+
+            memset(buf, 0, MAX_BUF_LEN);
+        }
         start = end + 1;
     }
 
-    close(fd);
+exit:
+    close(log_file_fd);
 
-    return ret;
+    return (rc != -1) ? 0 : -1;
 }
 
 /**
- *  Creates a passive TCP socket and return socket fd to the calling
- *  function which will be used for accepting incoming connections.
+ * @brief A thread function runs for every new incoming client
+ * connection.
+ *
+ * @param thread_param struct node data
+ * @return void* returns NULL
  */
-static int create_listener_socket(void)
+void *thread_func(void *thread_param)
 {
-    int sock;
-    int opt_val = 1;
-    struct addrinfo hints, *result, *rp;
+    int rc;
+    struct node *n = NULL;
+    char *msg = NULL;
+    int msg_size = 0;       /* total size of *msg */
+    int msg_len = 0;        /* bytes available in *msg */
+    char buf[MAX_BUF_LEN] = {};
 
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;      /* Allow IPv4 or IPv6 */
-    hints.ai_socktype = SOCK_STREAM;/* TCP socket */
-    hints.ai_flags = AI_PASSIVE;    /* For wildcard IP address */
-    if (getaddrinfo(NULL, PORT, &hints, &result) != 0) {
-        syslog(LOG_ERR, "getaddrinfo() failed: %s!", strerror(errno));
-        return -1;
-    }
+    if (thread_param == NULL)
+        return NULL;
 
-    /* Walk through returned list until we find an address structure
-     * that can be used to successfully create and bind a socket. */
-    for (rp = result; rp != NULL; rp = rp->ai_next) {
-        if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-            syslog(LOG_ERR, "Failed to create an socket");
-            continue;
+    n = (struct node *) thread_param;
+
+    /* save every incoming data to msg buffer and search for '\n' character */
+    while (((rc = recv(n->connfd, buf, MAX_BUF_LEN, 0)) > 0) && caught_signal == 0) {
+        if ((msg_size - msg_len) < rc) {
+            msg_size += (rc + NULL_BYTE);
+
+            msg = (char *) realloc(msg, msg_size);
+            if (msg == NULL) {
+                syslog(LOG_ERR, "failed to allocate memory for msg");
+                break;
+            }
+            memset(msg + msg_len, 0, msg_size - msg_len);
         }
 
-        if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt_val,
-                        sizeof(opt_val)) < 0) {
-            syslog(LOG_ERR, "Failed to set options for socket");
-        }
+        memcpy(msg + msg_len, buf, rc);
+        msg_len += rc;
 
-        if (bind(sock, rp->ai_addr, rp->ai_addrlen) == 0)
+        if (process_msg(msg, n->connfd, n->mutex) != 0)
             break;
-
-        close(sock);
     }
 
-    freeaddrinfo(result);
+    if (msg != NULL)
+        free(msg);
 
-    if (rp == NULL) {
-        syslog(LOG_ERR, "Could not bind socket to any address");
-        return -1;
-    }
+    n->thread_complete_success = 1;
+    close(n->connfd);
 
-    if (listen(sock, BACKLOG) != 0) {
-        syslog(LOG_ERR, "Failed to mark socket to accept incoming connection requests");
-        close(sock);
-        return -1;
-    }
-
-    return sock;
+    return NULL;
 }
 
+/**
+ * @brief A timerthread function logs timestamp to *log_file every
+ * TIMER_THREAD_PERIOD seconds. The sleep routine is based on
+ * explanation from Chapter: 11 Time.
+ *
+ * @param thread_param struct node data
+ * @return void* returns NULL
+ */
+void *timer_thread_func(void *thread_param)
+{
+    struct node *n = NULL;
+    struct tm *tmp;
+    struct timespec ts;
+    time_t t;
+    char outstr[MAX_BUF_LEN] = {};
+    int fd;
+
+    if (thread_param == NULL)
+        return NULL;
+
+    n = (struct node *) thread_param;
+
+    while (!caught_signal) {
+        if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+            syslog(LOG_ERR, "failed to retrieve time");
+            break;
+        }
+
+        ts.tv_sec += TIMER_THREAD_PERIOD;   /* 10 seconds */
+        if (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) != 0) {
+            syslog(LOG_ERR, "failed to sleep");
+            break;
+        }
+
+        t = time(NULL);
+        if (t == ((time_t) -1)) {
+            syslog(LOG_ERR, "failed to retrieve the seconds since epoch");
+            break;
+        }
+
+        tmp = localtime(&t);
+        if (tmp == NULL) {
+            syslog(LOG_ERR, "failed to retrieve localtime");
+            break;
+        }
+
+        strftime(outstr, sizeof(outstr), "timestamp: %Y, %b, %d, %H:%M:%S\n", tmp);
+
+        fd = open(log_file, (O_CREAT | O_APPEND | O_RDWR), FILE_MODE);
+        if (fd == -1) {
+            syslog(LOG_ERR, "failed to open %s", log_file);
+            break;
+        }
+
+        if (pthread_mutex_lock(n->mutex) != 0) {
+            close(fd);
+            syslog(LOG_ERR, "failed to lock mutex object before writing timestamp");
+            break;
+        }
+
+        if (write(fd, outstr, strlen(outstr)) == -1)
+            syslog(LOG_ERR, "failed to write timestamp to %s", log_file);
+
+        if (pthread_mutex_unlock(n->mutex) != 0) {
+            close(fd);
+            syslog(LOG_ERR, "failed to unlock mutex object after writing timestamp");
+            break;
+        }
+
+        close(fd);
+    }
+
+    /* we set this flag to make the parent process to join the thread */
+    n->thread_complete_success = 1;
+
+    return NULL;
+}
+
+/**
+ * @brief Create a listener socket object.
+ *
+ * @param sock file descriptor of listenting socket
+ * @param portnum port number to bind
+ * @return int 0 on success or -1 on failure
+ */
+static int create_listener_socket(int *sock, int portnum)
+{
+    int optval = 1;
+    struct sockaddr_in sa;
+
+    if ((*sock = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
+        syslog(LOG_ERR, "failed to create a socket: %s", strerror(errno));
+        return -1;
+    }
+
+    if (setsockopt(*sock, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) != 0) {
+        syslog(LOG_ERR, "failed to set socket options: %s", strerror(errno));
+        return -1;
+    }
+
+    bzero((char *)&sa, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_ANY);
+    sa.sin_port = htons((unsigned short) portnum);
+    if (bind(*sock, (struct sockaddr *) &sa, sizeof(sa)) != 0) {
+        syslog(LOG_ERR, "failed to bind socket to port %d: %s", PORT_NUMBER, strerror(errno));
+        return -1;
+    }
+
+    if (listen(*sock, MAX_BACKLOG) != 0) {
+        syslog(LOG_ERR, "failed to mark socket %d as passive: %s", *sock, strerror(errno));
+        return -1;
+    }
+
+    return 0;
+}
+
+/**
+ * @brief Initialize & setup resources required to run a simple TCP
+ * socket server with multi-threaded support.
+ *
+ * @param mode 0 - normal process or 1 - daemon
+ * @return int 0 on success or -1 on failure
+ */
+static int aesdsocket(int *mode)
+{
+    int rc = -1;
+    int socket, newfd = -1;
+    struct sockaddr_in addr;
+    socklen_t addrlen = sizeof(addr);
+    struct node *n = NULL;
+    struct node *n_tmp = NULL;
+    pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+
+    /* init linked-list */
+    SLIST_HEAD(head_s, node) head;
+    SLIST_INIT(&head);
+
+    rc = create_listener_socket(&socket, PORT_NUMBER);
+    if (rc == -1)
+        goto error;
+
+    if (*mode)
+        daemon(0, 0);
+
+    /* timer thread to write timestamp to *log_file */
+    n = (struct node *) calloc(1, sizeof(struct node));
+    if (n == NULL) {
+        syslog(LOG_ERR, "failed to allocate memory for timer node: %s", strerror(errno));
+        rc = -1;
+        goto error;
+    }
+    n->mutex = &mutex;
+    n->thread_complete_success = 0;
+    rc = pthread_create(&n->tid, NULL, timer_thread_func, n);
+    if (rc != 0) {
+        syslog(LOG_ERR, "failed to create timer thread: %s", strerror(errno));
+        goto error;
+    }
+    SLIST_INSERT_HEAD(&head, n, nodes);
+
+    while (!caught_signal) {
+        newfd = accept(socket, (struct sockaddr *) &addr, &addrlen);
+        if (newfd == -1) {
+            rc = -1;
+            goto reap_threads;
+        }
+
+        syslog(LOG_INFO, "Accepted connection from %s", inet_ntoa(addr.sin_addr));
+
+        /* thread per client connection */
+        n = (struct node *) calloc(1, sizeof(struct node));
+        if (n == NULL) {
+            syslog(LOG_ERR, "failed to allocate memory for client node: %s", strerror(errno));
+            rc = -1;
+            goto error;
+        }
+        n->connfd = newfd;
+        n->mutex = &mutex;
+        n->thread_complete_success = 0;
+        rc = pthread_create(&n->tid, NULL, thread_func, n);
+        if (rc != 0) {
+            syslog(LOG_ERR, "failed to create client thread: %s", strerror(errno));
+            goto error;
+        }
+        SLIST_INSERT_HEAD(&head, n, nodes);
+
+reap_threads:
+        /* remove all thread from linked-list, if threads have completed execution */
+        n = NULL;
+        SLIST_FOREACH_SAFE(n, &head, nodes, n_tmp) {
+            if (n->thread_complete_success) {
+                pthread_join(n->tid, NULL);
+                SLIST_REMOVE(&head, n, node, nodes);
+                free(n);
+            }
+        }
+    }
+
+error:
+    if (socket != -1) {
+        shutdown(socket, SHUT_RDWR);
+        close(socket);
+    }
+
+    /* delete linked-list */
+    n = NULL;
+    while (!SLIST_EMPTY(&head)) {
+        n = SLIST_FIRST(&head);
+        SLIST_REMOVE_HEAD(&head, nodes);
+        free(n);
+    }
+    SLIST_INIT(&head);
+
+    pthread_mutex_destroy(&mutex);
+
+    return rc;
+}
+
+/**
+ * @brief       main function
+ *
+ * @param argc  argument count
+ * @param argv  argument values as vector
+ * @return int  0 on success or -1 on failure
+ */
 int main(int argc, char *argv[])
 {
-    int ret = 0;
-    struct sigaction sa;
-    int opt;
+    int rc, opt;
     int run_as_daemon = 0;
-    int socket, client_fd;
-    struct sockaddr_in client_addr;
-    socklen_t client_addrlen = sizeof(client_addr);
-    char client_ip[INET_ADDRSTRLEN] = {};
-    char stream[MAX_LEN + 1] = {};
-    ssize_t nb;
-    char *buf;
-    int buf_len = 0;
-    int error = 0;
-    pid_t pid;
+    struct sigaction sa;
 
-    /* open a connection to system logger */
     openlog(NULL, SYSLOG_OPTIONS, LOG_USER);
 
-    /* parse command-line args */
+    /* parse command-line arguments */
     while ((opt = getopt(argc, argv, "d")) != -1) {
         switch (opt) {
         case 'd':
             run_as_daemon = 1;
-            syslog(LOG_INFO, "%s server will run as a daemon\n", argv[0]);
+            syslog(LOG_INFO, "running %s in daemon mode", argv[0]);
             break;
         }
     }
 
-    /* set-up handler for SIGINT & SIGTERM signals */
+    /* set-up signal handler for SIGINT & SIGTERM */
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
     sa.sa_handler = signal_handler;
-    if (sigaction(SIGINT, &sa, NULL) == -1) {
-        syslog(LOG_ERR, "Failed to change action for SIGINT!\n");
-        return -1;
-    }
-    if (sigaction(SIGTERM, &sa, NULL) == -1) {
-        syslog(LOG_ERR, "Failed to change action for SIGTERM!\n");
-        return -1;
+
+    rc = sigaction(SIGINT, &sa, NULL);
+    if (rc != 0) {
+        syslog(LOG_ERR, "failed to setup signal handler for SIGINT");
+        goto exit;
     }
 
-    if ((socket = create_listener_socket()) < 0)
-        return -1;
-
-    /* Close socket when any failure occurs during a new process
-     * creation. */
-    if (run_as_daemon) {
-        pid = fork();
-        if (pid < 0) {
-            close(socket);
-            syslog(LOG_ERR, "Failed to create a new process: %s", strerror(errno));
-            return -1;
-        }
-
-        if (pid != 0)
-            exit(EXIT_SUCCESS);
-
-        if (setsid () == -1) {
-            close(socket);
-            syslog(LOG_ERR, "Failed to create a new session: %s", strerror(errno));
-            return -1;
-        }
-
-        if (chdir("/")) {
-            close(socket);
-            syslog(LOG_ERR, "Failed to change to root dir: %s", strerror(errno));
-            return -1;
-        }
-
-        /* redirect fd's 0,1,2 to /dev/null */
-        open("/dev/null", O_RDWR);
-        dup(0);
-        dup(0);
+    rc = sigaction(SIGTERM, &sa, NULL);
+    if (rc != 0) {
+        syslog(LOG_ERR, "failed to setup signal handler for SIGTERM");
+        goto exit;
     }
 
-    while (!interrupted) {
-        if ((client_fd = accept(socket, (struct sockaddr *) &client_addr,
-                                &client_addrlen)) < 0)
-            continue;
+    /* we are all set to run aesdsocket server */
+    rc = aesdsocket(&run_as_daemon);
 
-        inet_ntop(AF_INET, &(client_addr.sin_addr), client_ip, INET6_ADDRSTRLEN);
-        syslog(LOG_INFO, "Accepted connection from %s\n", client_ip);
-
-        memset(stream, 0, MAX_LEN);
-        buf = malloc(sizeof(char));
-        *buf = '\0';
-        buf_len = 1;
-
-        while ((nb = recv(client_fd, stream, MAX_LEN, 0)) > 0) {
-            buf_len += nb;
-            if ((buf = realloc(buf, (sizeof(char) * buf_len))) == NULL) {
-                syslog(LOG_ERR, "Failed to reallocate memory for data stream: %s", strerror(errno));
-                error = 1;
-                break;
-            }
-
-            strncat(buf, stream, nb);
-            if (process_data(buf) > 0) {
-                if (echo_data(client_fd) < 0)
-                    error = 1;
-            }
-
-            memset(stream, 0, MAX_LEN);
-        }
-
-        if (buf != NULL)
-            free(buf);
-
-        close(client_fd);
-
-        /* break for any errors */
-        if (error)
-            break;
-    }
-
+exit:
+    syslog(LOG_INFO, "Exiting aesdsocket!");
     remove(log_file);
-    close(socket);
-    shutdown(socket, SHUT_RDWR);
     closelog();
 
-    return ret;
+    return rc;
 }
