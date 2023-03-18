@@ -46,7 +46,14 @@
 #define NULL_BYTE               1
 #define TIMER_THREAD_PERIOD     10
 
+#define USE_AESD_CHAR_DEVICE    1
+
+#if (USE_AESD_CHAR_DEVICE == 1)
+const char *log_file = "/dev/aesdchar";
+#elif (USE_AESD_CHAR_DEVICE == 0)
 const char *log_file = "/var/tmp/aesdsocketdata";
+#endif
+
 volatile sig_atomic_t caught_signal = 0;
 
 struct node {
@@ -85,9 +92,12 @@ static int process_msg(char *msg, int fd, pthread_mutex_t *mutex)
     int rc = 0;
     int log_file_fd, cnt;
     char *start, *end;
+#if (USE_AESD_CHAR_DEVICE == 0)
     struct stat statbuf;
-    char buf[MAX_BUF_LEN];
     off_t offset = 0;
+#endif
+    char buf[MAX_BUF_LEN];
+
 
     start = end = (char *) msg;
 
@@ -122,6 +132,7 @@ static int process_msg(char *msg, int fd, pthread_mutex_t *mutex)
             cnt += rc;
         }
 
+#if (USE_AESD_CHAR_DEVICE == 0)
         /* read file total size, in bytes */
         rc = fstat(log_file_fd, &statbuf);
         if (rc != 0) {
@@ -147,6 +158,16 @@ static int process_msg(char *msg, int fd, pthread_mutex_t *mutex)
 
             memset(buf, 0, MAX_BUF_LEN);
         }
+#elif (USE_AESD_CHAR_DEVICE == 1)
+        memset(buf, 0, MAX_BUF_LEN);
+        do {
+            rc = read(log_file_fd, buf, 1);
+            if (rc == -1)
+                goto exit;
+            if (send(fd, buf, rc, 0) == -1)
+                goto exit;
+        } while (rc != 0);
+#endif
         start = end + 1;
     }
 
@@ -351,6 +372,7 @@ static int aesdsocket(int *mode)
     if (*mode)
         daemon(0, 0);
 
+#if (USE_AESD_CHAR_DEVICE == 0)
     /* timer thread to write timestamp to *log_file */
     n = (struct node *) calloc(1, sizeof(struct node));
     if (n == NULL) {
@@ -366,6 +388,7 @@ static int aesdsocket(int *mode)
         goto error;
     }
     SLIST_INSERT_HEAD(&head, n, nodes);
+#endif
 
     while (!caught_signal) {
         newfd = accept(socket, (struct sockaddr *) &addr, &addrlen);
