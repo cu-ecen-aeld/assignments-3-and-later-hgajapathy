@@ -55,9 +55,16 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
     ssize_t retval = 0;
     size_t entry_offset = 0;
     struct aesd_buffer_entry *entry = NULL;
-    struct aesd_dev *dev = filp->private_data;
+    struct aesd_dev *dev = NULL;
+
+    if (filp == NULL || buf == NULL) {
+        PDEBUG("invalid arguments\n");
+        return -EINVAL;
+    }
 
     PDEBUG("read %zu bytes with offset %lld\n", count, *f_pos);
+
+    dev = filp->private_data;
 
     if (mutex_lock_interruptible(&dev->lock) != 0) {
         PDEBUG("failed to acquire mutex\n");
@@ -83,9 +90,16 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
 {
     ssize_t retval = -ENOMEM;
     const char *rtnptr = NULL;
-    struct aesd_dev *dev = filp->private_data;
+    struct aesd_dev *dev = NULL;
+
+    if (filp == NULL || buf == NULL) {
+        PDEBUG("invalid arguments\n");
+        return -EINVAL;
+    }
 
     PDEBUG("write %zu bytes with offset %lld\n", count, *f_pos);
+
+    dev = filp->private_data;
 
     if (mutex_lock_interruptible(&dev->lock) != 0) {
         PDEBUG("failed to acquire mutex\n");
@@ -185,6 +199,8 @@ void aesd_cleanup_module(void)
 
     PDEBUG("cleanup_module\n");
 
+    mutex_destroy(&aesd_device.lock);
+
     AESD_CIRCULAR_BUFFER_FOREACH(entry, &aesd_device.cb, index) {
         if (entry->buffptr != NULL) {
             PDEBUG("bufferptr - %s, size %ld\n", entry->buffptr, entry->size);
@@ -193,7 +209,6 @@ void aesd_cleanup_module(void)
     }
 
     cdev_del(&aesd_device.cdev);
-
     unregister_chrdev_region(devno, 1);
 }
 
