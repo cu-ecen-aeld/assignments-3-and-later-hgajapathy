@@ -29,7 +29,9 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <regex.h>
 
+#include "aesd_ioctl.h"
 #include "queue.h"      /* taken from https://github.com/freebsd/freebsd-src/blob/main/sys/sys/queue.h */
 
 // #define DEBUG    /* un-comment this line to redirect output to stdout */
@@ -95,6 +97,10 @@ static int process_msg(char *msg, int fd, pthread_mutex_t *mutex)
 #if (USE_AESD_CHAR_DEVICE == 0)
     struct stat statbuf;
     off_t offset = 0;
+#elif (USE_AESD_CHAR_DEVICE == 1)
+    regex_t preg;
+    char *pattern = "(AESDCHAR_IOCSEEKTO).*";
+    struct aesd_seekto seekto;
 #endif
     char buf[MAX_BUF_LEN];
 
@@ -110,6 +116,25 @@ static int process_msg(char *msg, int fd, pthread_mutex_t *mutex)
     log_file_fd = rc;
 
     while ((end = strchr(start, '\n')) != NULL) {
+#if (USE_AESD_CHAR_DEVICE == 1)
+        /* handle AESDCHAR_IOCSEEKTO:X,Y */
+        if ((rc = regcomp(&preg, pattern, REG_EXTENDED)) != 0)
+            goto exit;
+
+        if ((rc = regexec(&preg, start, 0, 0, 0)) == 0) {
+            syslog(LOG_DEBUG, "found '%s' in %s", pattern, start);
+            sscanf(start, "AESDCHAR_IOCSEEKTO:%d,%d", &seekto.write_cmd, &seekto.write_cmd_offset);
+        }
+
+        regfree(&preg);
+
+        if (rc != REG_NOMATCH) {
+            rc = ioctl(log_file_fd, AESDCHAR_IOCSEEKTO, &seekto);
+            if (rc != 0)
+                syslog(LOG_ERR, "failed to execute ioctl command for %s", log_file);
+            goto read_device;
+        }
+#endif
         /* write packet to log file */
         cnt = 0;
         while (cnt != ((end - start) + 1)) {
@@ -159,6 +184,7 @@ static int process_msg(char *msg, int fd, pthread_mutex_t *mutex)
             memset(buf, 0, MAX_BUF_LEN);
         }
 #elif (USE_AESD_CHAR_DEVICE == 1)
+read_device:
         memset(buf, 0, MAX_BUF_LEN);
         do {
             rc = read(log_file_fd, buf, 1);
