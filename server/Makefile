@@ -3,6 +3,7 @@
 CC 		?= $(CROSS_COMPILE)gcc
 CFLAGS 	?= -g -Werror -Wall
 LDFLAGS ?= -pthread
+INCLUDES = -I ../aesd-char-driver/
 
 SRC		= $(wildcard *.c)
 OBJS	= $(SRC:.c=.o)
@@ -14,7 +15,7 @@ ${EXE}: $(OBJS)
 	$(CC) -o $@ $^ ${LDFLAGS}
 
 %.o: %.c
-	$(CC) -c ${CFLAGS} $< -o $@
+	$(CC) -c ${CFLAGS} ${INCLUDES} $< -o $@
 
 .PHONY: clean
 
